@@ -62,7 +62,9 @@ Generate an Antilatency SDK subset with the [SDK Configurator](https://developer
 You can add other components depending on your application, hardware, tools, and deployment platform.
 
 > [!IMPORTANT]
-> Use compatible Antilatency SDK and AntilatencyService versions for your target platform. Avoid mixing SDK binaries, generated headers, and service versions from unrelated releases.
+> AntilatencyService is useful during setup because it can show the node tree, inspect device properties, and help configure devices. It is not required as a parallel runtime for your engine application.
+>
+> Do not keep AntilatencyService running while your application creates and uses its own Device Network. Only one Device Network should be active for the connected devices at a time.
 
 ---
 
@@ -75,18 +77,22 @@ flowchart TB
     DN["Device Network"]
 
     PCE["Physical Configurable<br/>Environment"]
-    Screen["Screen Position<br/>ScreenX / ScreenY"]
+    Screen["Screen Geometry<br/>ScreenPosition / ScreenX / ScreenY"]
     EnvCode["Environment Code"]
     Selector["Environment<br/>Selector"]
     Env["Environment"]
 
+    ExtensionNode["Stylus Extension<br/>Node"]
     HEI["Hardware Extension<br/>Interface"]
-    Button["Stylus Button<br/>IO Pin"]
+    Button["Button Pin<br/>State"]
 
+    AltNode["Child Alt<br/>Node"]
     Alt["Alt Tracking"]
     Pose["Stylus Pose<br/>+ Motion"]
 
-    EngineTransform["Engine Display<br/>Transform"]
+    DisplayTransform["Engine Screen<br/>Transform"]
+    Mapping["Engine Coordinate<br/>Mapping"]
+    StylusTransform["Engine Stylus<br/>Transform"]
     InputSystem["Engine Input<br/>System"]
 
     App --> DN
@@ -97,19 +103,23 @@ flowchart TB
     EnvCode --> Selector
     Selector --> Env
 
-    DN --> HEI
+    DN --> ExtensionNode
+    ExtensionNode --> HEI
     HEI --> Button
 
-    DN --> Alt
+    ExtensionNode --> AltNode
+    AltNode --> Alt
     Env --> Alt
     Alt --> Pose
 
-    Screen --> EngineTransform
-    Pose --> EngineTransform
+    Screen --> DisplayTransform
+    Screen --> Mapping
+    Pose --> Mapping
+    Mapping --> StylusTransform
     Button --> InputSystem
 ```
 
-The physical environment device knows which Environment it represents and controls the IR markers. Your application reads this information, creates the corresponding Environment, and then tracks each stylus Alt inside it.
+The physical environment/display device provides screen geometry and an environment code. Your application creates the corresponding Environment from that code, uses it to track the child Alt node of each stylus, and maps the resulting pose into your engine coordinates. The screen geometry configures the virtual screen/display transform; the tracked stylus pose configures the virtual stylus transform.
 
 ---
 
@@ -121,7 +131,8 @@ The physical environment device knows which Environment it represents and contro
 2. Select the release, platform, and C++ language binding required by your engine.
 3. Include the required components listed above.
 4. Add the generated headers, libraries, and runtime binaries to your engine project.
-5. Make sure AntilatencyService installed on the target machine uses the same SDK release family.
+5. Optionally use AntilatencyService during setup to inspect the node tree, check device properties, or configure devices.
+6. Close AntilatencyService before running your application.
 
 ### 2. Initialize Device Network
 
@@ -148,6 +159,58 @@ struct DisplayStylusRuntime {
 
 The exact namespace and loading syntax depend on the generated SDK version, so treat the snippets in this README as implementation guidance rather than copy-paste code.
 
+### Runtime lifecycle and errors
+
+Antilatency devices are physical devices, so treat SDK objects as live runtime resources, not as static data. A node can disappear, a task can fail to start, and an already started cotask can finish when the device is disconnected.
+
+Recommended rules:
+
+- Check that every cotask is valid and not finished before reading from it.
+- Treat `startTask(...)`, `createInputPin(...)`, `run()`, environment creation, and device-property reads as operations that can fail.
+- Use `try/catch` around setup, task start, and recovery code. Do not use exceptions as normal per-frame control flow.
+- If startup fails halfway, release every cotask/input pin that was already created.
+- If a running cotask finishes, mark the stylus or display as disconnected, release its resources, and return to discovery.
+- Use Device Network updates, for example `getUpdateId()`, to know when it is worth repeating discovery.
+
+The exact helper names depend on your wrapper, but the logic should look like this:
+
+```cpp
+// Wrapper helper, not an Antilatency SDK function.
+// Should check SDK interface validity and then call ICotask::isTaskFinished().
+template <typename TCotask>
+bool isCotaskAlive(const TCotask& cotask) {
+    return cotask != nullptr && !cotask.isTaskFinished();
+}
+
+// Wrapper helper, not an Antilatency SDK function.
+// Tracking and button polling can be checked independently.
+bool isTrackingCotaskAlive(const StylusRuntime& stylus) {
+    return isCotaskAlive(stylus.trackingCotask);
+}
+
+// Wrapper helper, not an Antilatency SDK function.
+// Should verify that the HEI cotask is alive and the input pin interface is valid.
+bool isButtonCotaskAlive(const StylusRuntime& stylus) {
+    return isCotaskAlive(stylus.extensionCotask) && stylus.buttonPin != nullptr;
+}
+
+// Wrapper helper, not an Antilatency SDK function.
+// Should verify that the Physical Configurable Environment cotask and Environment are valid.
+bool isDisplayEnvironmentAlive(const DisplayEnvironmentRuntime& display) {
+    return isCotaskAlive(display.cotask) && display.environment != nullptr;
+}
+```
+
+The examples below use broad `catch (...)` only to keep the pseudocode short. In production code, catch the exception types exposed by your generated SDK/binding, log the reason, release partially created resources, and retry discovery when Device Network changes.
+
+Useful official references for the examples below:
+
+- [`ITrackingCotask::getExtrapolatedState`](https://developers.antilatency.com/Api/V3_5_1/Antilatency/Alt/Tracking/ITrackingCotask/Methods/getExtrapolatedState_en.html)
+- [Antilatency Hardware Extension Interface Library](https://developers.antilatency.com/Software/Libraries/Antilatency_Hardware_Extension_Interface_Library_en.html)
+- [`IInputPin::getState`](https://developers.antilatency.com/Api/V4_6_0/Antilatency/HardwareExtensionInterface/IInputPin/Methods/getState_en.html)
+- [Antilatency Device Network Library](https://developers.antilatency.com/Software/Libraries/Antilatency_Device_Network_Library_en.html)
+- [Antilatency Tracking Minimal Demo C++](https://github.com/antilatency/Antilatency.TrackingMinimalDemoCpp)
+
 ### 3. Start the Physical Configurable Environment
 
 Start the Physical Configurable Environment task on the supported display/environment node.
@@ -171,20 +234,34 @@ struct DisplayEnvironmentRuntime {
 };
 
 DisplayEnvironmentRuntime startDisplayEnvironment(DisplayStylusRuntime& runtime) {
-    auto nodes = runtime.physicalEnvironmentConstructor.findSupportedNodes(runtime.network);
-    auto displayNode = findFirstIdleNode(runtime.network, nodes);
-
-    auto cotask = runtime.physicalEnvironmentConstructor.startTask(runtime.network, displayNode);
-
     DisplayEnvironmentRuntime result;
-    result.cotask = cotask;
-    result.screenPosition = result.cotask.getScreenPosition();
-    result.screenX = result.cotask.getScreenX();
-    result.screenY = result.cotask.getScreenY();
 
-    auto configId = result.cotask.getConfigId();
-    auto environmentCode = result.cotask.getEnvironment(configId);
-    result.environment = runtime.environmentSelectorLibrary.createEnvironment(environmentCode);
+    try {
+        auto nodes = runtime.physicalEnvironmentConstructor.findSupportedNodes(runtime.network);
+
+        // Wrapper helper, not an Antilatency SDK function.
+        // Should choose an idle node that supports Physical Configurable Environment task.
+        auto displayNode = findFirstIdleNode(runtime.network, nodes);
+
+        if (displayNode == DeviceNetwork::NodeHandle::Null) {
+            return result;
+        }
+
+        result.cotask =
+            runtime.physicalEnvironmentConstructor.startTask(runtime.network, displayNode);
+
+        result.screenPosition = result.cotask.getScreenPosition();
+        result.screenX = result.cotask.getScreenX();
+        result.screenY = result.cotask.getScreenY();
+
+        auto configId = result.cotask.getConfigId();
+        auto environmentCode = result.cotask.getEnvironment(configId);
+        result.environment = runtime.environmentSelectorLibrary.createEnvironment(environmentCode);
+    } catch (...) {
+        // Wrapper helper, not an Antilatency SDK function.
+        // Should safely release result.cotask and clear result.environment.
+        releaseDisplayEnvironment(result);
+    }
 
     return result;
 }
@@ -196,40 +273,27 @@ If the created Environment supports orientation awareness, query the orientation
 
 ```cpp
 Quat getEnvironmentRotation(const DisplayEnvironmentRuntime& display) {
+    // Wrapper helper, not an Antilatency SDK function.
+    // Should QueryInterface/cast display.environment to IOrientationAwareEnvironment when supported.
     auto orientationAware = queryOrientationAwareEnvironment(display.environment);
 
     if (!orientationAware) {
         return Quat::identity();
     }
 
-    auto rotation = orientationAware.getRotation();
-    return isNormalized(rotation) ? rotation : Quat::identity();
+    return orientationAware.getRotation();
 }
 ```
 
-Use this on demand. For example, if the physical screen or marker structure can be tilted or rotated and your virtual scene should reproduce that orientation, read the Environment rotation before applying the display transform. If your engine uses a fixed virtual screen orientation, you can skip this step or use identity rotation.
-
-```cpp
-// Use this only if your engine should reproduce the current physical orientation.
-Quat optionalDisplayRotation = getEnvironmentRotation(display);
-
-applyDisplayTransform(
-    display.screenPosition,
-    display.screenX,
-    display.screenY,
-    optionalDisplayRotation
-);
-```
-
----
-
 ## Display Geometry
 
-`ScreenPosition`, `ScreenX`, and `ScreenY` describe the physical screen in environment space.
+`ScreenPosition`, `ScreenX`, and `ScreenY` describe the physical screen in Environment space.
+
+`ScreenPosition` is the offset from the Environment coordinate origin to the screen. This is needed because the physical markers can be located around the device in one place, while the actual screen center or screen coordinate frame can be in another place. Use this offset to connect tracking data from the Environment to the virtual screen in your engine.
 
 | Value | Meaning |
 | --- | --- |
-| `ScreenPosition` | Position of the screen relative to the environment, in meters. |
+| `ScreenPosition` | Offset from the Environment origin to the screen coordinate frame, in meters. |
 | `ScreenX` | X half-axis vector of the screen. Its magnitude is half of the screen width in meters. |
 | `ScreenY` | Y half-axis vector of the screen. Its magnitude is half of the screen height in meters. |
 
@@ -250,18 +314,6 @@ struct DisplayGeometry {
 };
 ```
 
-If your virtual display pivot is at the screen center, use `ScreenPosition` directly as the display offset.
-
-If your virtual display pivot is at the bottom center of the screen, shift the offset by `ScreenY`:
-
-```cpp
-Vec3 environmentOffset = screenPosition;
-
-if (displayPivot == DisplayPivot::BottomCenter) {
-    environmentOffset += screenY;
-}
-```
-
 All values are in meters. Avoid applying hidden scale transforms unless your engine wrapper converts every value consistently.
 
 ---
@@ -273,22 +325,86 @@ A stylus is normally represented as an Extension Module node with a child Alt no
 - the **Extension Module** handles the button or other hardware inputs;
 - the child **Alt** handles position and rotation tracking.
 
-Find a supported Hardware Extension Interface node that represents the stylus, then find the Alt node whose parent is the selected extension node.
+For the ready Antilatency stylus, the extension node still works through the Hardware Extension Interface, but it should be selected by its hardware name. The Unity reference searches Hardware Extension Interface-supported nodes, picks an idle node whose `HardwareName` contains `AntilatencyStylusAlpha`, then finds the Alt node whose parent is that extension node.
+
+In Unity this is done one stylus at a time when Device Network update id changes. For a custom engine README, it is clearer to show the same logic as a function that returns all currently available stylus device pairs.
 
 ```cpp
-StylusDevice findStylusDevice(DisplayStylusRuntime& runtime) {
-    auto extensionNodes = runtime.hardwareExtensionConstructor.findSupportedNodes(runtime.network);
-    auto altNodes = runtime.altTrackingConstructor.findSupportedNodes(runtime.network);
+struct StylusDevice {
+    DeviceNetwork::NodeHandle extensionNode;
+    DeviceNetwork::NodeHandle altNode;
+};
 
-    auto extensionNode = findStylusExtensionNode(runtime.network, extensionNodes);
+std::vector<StylusDevice> findAvailableStylusDevices(DisplayStylusRuntime& runtime) {
+    std::vector<StylusDevice> result;
 
-    auto altNode = findChildAltNode(runtime.network, altNodes, extensionNode);
+    try {
+        auto extensionNodes = runtime.hardwareExtensionConstructor.findSupportedNodes(runtime.network);
+        auto altNodes = runtime.altTrackingConstructor.findSupportedNodes(runtime.network);
 
-    return { extensionNode, altNode };
+        for (const auto& extensionNode : extensionNodes) {
+            // Antilatency SDK call: INetwork::nodeGetStatus(...).
+            // Only idle nodes can be used to start a new stylus task.
+            if (runtime.network.nodeGetStatus(extensionNode) != DeviceNetwork::NodeStatus::Idle) {
+                continue;
+            }
+
+            // Antilatency SDK call: INetwork::nodeGetStringProperty(...).
+            // Use the HardwareName property key from your generated DeviceNetwork headers.
+            auto hardwareName = runtime.network.nodeGetStringProperty(
+                extensionNode,
+                DeviceNetwork::Interop::Constants::HardwareNameKey
+            );
+
+            if (hardwareName.find("AntilatencyStylusAlpha") == std::string::npos) {
+                continue;
+            }
+
+            StylusDevice stylusDevice;
+            stylusDevice.extensionNode = extensionNode;
+
+            // Wrapper helper, not an Antilatency SDK function.
+            // Should find an Alt Tracking node whose parent is stylusDevice.extensionNode.
+            // The parent check is done with INetwork::nodeGetParent(...).
+            stylusDevice.altNode =
+                findChildAltNode(runtime.network, altNodes, stylusDevice.extensionNode);
+
+            if (stylusDevice.altNode == DeviceNetwork::NodeHandle::Null) {
+                continue;
+            }
+
+            result.push_back(stylusDevice);
+        }
+    } catch (...) {
+        result.clear();
+    }
+
+    return result;
 }
 ```
 
-Multiple styluses can be connected. Your wrapper should repeat this discovery flow for every stylus extension node that should be controlled by the application.
+Your application can call this when Device Network update id changes, then start tasks for the returned devices that are not already managed by your engine.
+
+```cpp
+void refreshStyluses(DisplayStylusRuntime& runtime, const Alt::Environment::IEnvironment& environment) {
+    auto devices = findAvailableStylusDevices(runtime);
+
+    for (const auto& device : devices) {
+        // Wrapper helper, not an Antilatency SDK function.
+        // Should prevent starting duplicate tasks for the same extension/Alt pair.
+        if (isAlreadyManaged(device)) {
+            continue;
+        }
+
+        auto stylus = startStylus(runtime, device, environment);
+        if (isTrackingCotaskAlive(stylus) && isButtonCotaskAlive(stylus)) {
+            addManagedStylus(stylus);
+        }
+    }
+}
+```
+
+Multiple styluses can be connected. Your wrapper should repeat this discovery flow for every idle stylus extension node that should be controlled by the application.
 
 ---
 
@@ -309,16 +425,22 @@ StylusRuntime startStylus(
 ) {
     StylusRuntime stylus;
 
-    stylus.extensionCotask =
-        runtime.hardwareExtensionConstructor.startTask(runtime.network, device.extensionNode);
+    try {
+        stylus.extensionCotask =
+            runtime.hardwareExtensionConstructor.startTask(runtime.network, device.extensionNode);
 
-    stylus.buttonPin =
-        stylus.extensionCotask.createInputPin(HardwareExtensionInterface::Interop::Pins::IO1);
+        stylus.buttonPin =
+            stylus.extensionCotask.createInputPin(HardwareExtensionInterface::Interop::Pins::IO1);
 
-    stylus.extensionCotask.run();
+        stylus.extensionCotask.run();
 
-    stylus.trackingCotask =
-        runtime.altTrackingConstructor.startTask(runtime.network, device.altNode, environment);
+        stylus.trackingCotask =
+            runtime.altTrackingConstructor.startTask(runtime.network, device.altNode, environment);
+    } catch (...) {
+        // Wrapper helper, not an Antilatency SDK function.
+        // Should safely release input pin, HEI cotask, and tracking cotask if they were created.
+        releaseStylus(stylus);
+    }
 
     return stylus;
 }
@@ -329,36 +451,53 @@ StylusRuntime startStylus(
 
 ---
 
-## Per-Frame Update
+## Polling Stylus Pose
 
-Update the stylus as late as possible before rendering. This reduces the visible mismatch between the physical stylus and the rendered stylus.
+Poll the stylus pose as late as possible before rendering. This reduces the visible mismatch between the physical stylus and the rendered stylus.
 
-A common pattern is to update the pose in the last possible engine update stage before render submission and use `getExtrapolatedState(...)` with an extrapolation time tuned for your display pipeline.
+A common pattern is to read tracking state in the last possible engine update stage before render submission and use `getExtrapolatedState(...)` with an extrapolation time tuned for your display pipeline. This is independent from button polling.
 
 ```cpp
-DisplayStylusState pollStylusBeforeRender(
+struct StylusPoseSample {
+    int id;
+    bool connected;
+    Pose poseWorld;
+    Vec3 velocityWorld;
+    Vec3 angularVelocity;
+    TrackingStability stability;
+};
+
+StylusPoseSample pollStylusPoseBeforeRender(
     StylusRuntime& stylus,
     const DisplayEnvironmentRuntime& display,
     float extrapolationTimeSeconds
 ) {
-    DisplayStylusState result;
+    StylusPoseSample result;
     result.id = stylus.id;
-    result.connected = isStylusTaskAlive(stylus);
 
+    // Wrapper helper, not an Antilatency SDK function.
+    // Should return false when trackingCotask is null/invalid or isTaskFinished().
+    result.connected = isTrackingCotaskAlive(stylus);
     if (!result.connected) {
-        result.buttonPressed = false;
         return result;
     }
 
-    auto trackingState =
-        stylus.trackingCotask.getExtrapolatedState(identityPose(), extrapolationTimeSeconds);
+    // Wrapper helper, not an Antilatency SDK function.
+    // Should return the placement of the Alt in stylus-local coordinates.
+    // If your engine treats the Alt pose as the stylus pose directly, this can be identity placement.
+    auto trackingPlacement = getStylusTrackingPlacement(stylus);
 
+    // Antilatency SDK call:
+    // ITrackingCotask::getExtrapolatedState(Antilatency::Math::floatP3Q placement, float deltaTime)
+    auto trackingState =
+        stylus.trackingCotask.getExtrapolatedState(trackingPlacement, extrapolationTimeSeconds);
+
+    // Wrapper helpers, not Antilatency SDK functions.
+    // They should convert Antilatency coordinates/units into your engine world space.
     result.poseWorld = convertPoseToEngineSpace(trackingState.pose, display);
     result.velocityWorld = convertVectorToEngineSpace(trackingState.velocity, display);
     result.angularVelocity =
         convertAngularVelocityToEngineSpace(trackingState.localAngularVelocity, display);
-    result.buttonPressed =
-        stylus.buttonPin.getState() == HardwareExtensionInterface::Interop::PinState::Low;
     result.stability = trackingState.stability;
 
     return result;
@@ -380,52 +519,58 @@ There is no single correct transform formula for every engine. The right mapping
 - whether the screen is parented under another scene object;
 - whether you render the stylus in display-local space or world space.
 
-A common starting point:
+A common starting point is to build one screen/display transform and use it for the stylus pose. The rotation in that transform should be whatever your engine uses for the virtual screen. If you want the virtual screen to follow the physical screen or marker-structure tilt, this rotation can come from `getEnvironmentRotation(display)`. Do not apply the same Environment rotation again later.
+
+The example below treats `displayWorldPosition` as the world position of your virtual display object. `ScreenPosition` is added because it is the offset from the Environment origin to the screen.
 
 ```cpp
 Vec3 displayWorldPosition = getDisplayWorldPosition();
-Quat displayWorldRotation = getDisplayWorldRotation();
 
-Vec3 environmentOffset = screenPosition;
+// Wrapper helper, not an Antilatency SDK function.
+// Should return the final rotation of your virtual screen in engine world space.
+// It may be a fixed engine rotation, or getEnvironmentRotation(display), or a composition chosen by your engine.
+Quat screenWorldRotation = getScreenWorldRotation(display);
 
-if (displayPivot == DisplayPivot::BottomCenter) {
-    environmentOffset += screenY;
-}
+// Wrapper helper, not an Antilatency SDK function.
+// Should return the offset from the screen coordinate frame to your chosen screen pivot.
+// Example: zero for ScreenPosition pivot, screenY for bottom-center pivot.
+Vec3 screenPivotOffset = getScreenPivotOffset(screenX, screenY);
+
+Vec3 screenOffset =
+    screenPosition + screenPivotOffset;
 
 Vec3 localStylusPosition =
-    environmentOffset +
-    Vec3(
-        stylusPose.position.x,
-        stylusPose.position.y,
-        stylusPose.position.z
-    );
+    screenOffset + stylusPose.position;
 
 Vec3 worldStylusPosition =
-    displayWorldPosition + displayWorldRotation * localStylusPosition;
+    displayWorldPosition + screenWorldRotation * localStylusPosition;
 
 Quat worldStylusRotation =
-    displayWorldRotation * stylusPose.rotation;
+    screenWorldRotation * stylusPose.rotation;
 ```
 
-If the physical screen or marker structure can be tilted, apply that rotation consistently with the rest of your engine transform chain:
+For example, if you decide that the virtual screen should follow the current Environment rotation:
 
 ```cpp
-Quat environmentRotation = getEnvironmentRotation(display);
+Vec3 displayWorldPosition = getDisplayWorldPosition();
+Quat screenWorldRotation = getEnvironmentRotation(display);
+
+Vec3 screenPivotOffset = getScreenPivotOffset(screenX, screenY);
+
+Vec3 screenOffset =
+    screenPosition + screenPivotOffset;
 
 Vec3 localPosition =
-    environmentOffset + stylusPose.position;
-
-Vec3 rotatedPosition =
-    environmentRotation * localPosition;
+    screenOffset + stylusPose.position;
 
 Vec3 worldPosition =
-    displayWorldPosition + displayWorldRotation * rotatedPosition;
+    displayWorldPosition + screenWorldRotation * localPosition;
 
 Quat worldRotation =
-    displayWorldRotation * environmentRotation * stylusPose.rotation;
+    screenWorldRotation * stylusPose.rotation;
 ```
 
-If you apply the Environment rotation to the virtual display, avoid applying that rotation twice. For example, if your stylus is rendered under a display transform that already contains this rotation, convert the stylus pose into that display-local space consistently.
+The important part is to have one clear transform chain. If the virtual screen transform already contains Environment rotation, do not multiply by Environment rotation again when placing the stylus.
 
 ---
 
@@ -440,7 +585,6 @@ struct DisplayStylusDisplayData {
     Vec3 screenPositionMeters;
     Vec3 screenXHalfAxisMeters;
     Vec3 screenYHalfAxisMeters;
-    Mat4 screenToEnvironment;
 };
 
 class DisplayStylusDisplay {
@@ -456,16 +600,15 @@ private:
 };
 ```
 
-### Stylus state
+### Stylus pose state
 
 ```cpp
-struct DisplayStylusState {
+struct StylusPoseSample {
     int id;
+    bool connected;
     Pose poseWorld;
     Vec3 velocityWorld;
     Vec3 angularVelocity;
-    bool buttonPressed;
-    bool connected;
     TrackingStability stability;
 };
 ```
@@ -473,59 +616,34 @@ struct DisplayStylusState {
 ### Polling button state
 
 ```cpp
-bool readStylusButton(StylusRuntime& stylus) {
-    if (!isStylusTaskAlive(stylus)) {
-        return false;
+struct StylusButtonSample {
+    int id;
+    bool connected;
+    bool pressed;
+};
+
+StylusButtonSample pollStylusButton(StylusRuntime& stylus) {
+    StylusButtonSample result;
+    result.id = stylus.id;
+
+    // Wrapper helper, not an Antilatency SDK function.
+    // Should return false when extensionCotask/input pin is null/invalid
+    // or when the HEI cotask isTaskFinished().
+    result.connected = isButtonCotaskAlive(stylus);
+    if (!result.connected) {
+        result.pressed = false;
+        return result;
     }
 
-    return stylus.buttonPin.getState() == HardwareExtensionInterface::Interop::PinState::Low;
+    // Antilatency SDK call: IInputPin::getState().
+    // The "pressed" mapping is hardware-specific. IO1 + Low is one common configuration.
+    result.pressed =
+        stylus.buttonPin.getState() == HardwareExtensionInterface::Interop::PinState::Low;
+
+    return result;
 }
 ```
 
-Poll only the data your engine needs at that point. For example, you can poll only the button state for input handling, only the pose before rendering, or both as a single `DisplayStylusState`. If your input system needs press/release/click events, derive them by comparing the current polled button state with the previous one. This keeps disconnect handling explicit in your engine instead of hiding it inside a callback contract.
+Poll only the data your engine needs at that point. For example, poll only the button state for input handling and only the pose before rendering. If your input system needs press/release/click events, derive them by comparing the current polled button state with the previous one. This keeps disconnect handling explicit in your engine instead of hiding it inside a callback contract.
 
-Useful user-facing parameters:
-
-| Parameter | Purpose |
-| --- | --- |
-| `extrapolationTimeSeconds` | Predicts stylus pose to compensate render/display latency. |
-| `useEnvironmentRotation` | Optional engine-side choice: apply current Environment rotation when physical screen or marker-structure tilt should be reflected virtually. |
-| `displayOriginX`, `displayOriginY` | Lets the engine choose center, edge, or corner pivot behavior. |
-| `scaleMode` | Keeps the display in real meters or maps it to engine-specific normalized units. |
-| `showDebugDisplayBorder` | Optional debug visualization for screen bounds. |
-| `showDebugRuler` | Optional debug visualization for scale validation in meters. |
-
----
-
-## Validation Checklist
-
-Use this checklist when integrating into a new engine:
-
-- AntilatencyService sees the display/environment device and the stylus devices.
-- The generated SDK contains all required components.
-- SDK and AntilatencyService versions match.
-- The physical environment task returns valid `ScreenPosition`, `ScreenX`, `ScreenY`, and environment code.
-- The environment code successfully creates an Environment.
-- The stylus extension node is found and its child Alt node is detected.
-- The Hardware Extension task starts, creates the expected input pin, and calls `run()`.
-- The Alt Tracking task starts with the created Environment.
-- Button state changes are visible in your engine.
-- Stylus pose is updated immediately before rendering.
-- Screen size is correct in meters.
-- Display pivot compensation is correct.
-- Any physical Environment rotation used by the engine is applied exactly once.
-- Coordinate handedness and quaternion convention are converted correctly.
-
----
-
-## Troubleshooting
-
-| Symptom | What to check |
-| --- | --- |
-| No display/environment found | Check Device Network, AntilatencyService, SDK components, and whether another application already started the task. |
-| Environment cannot be created | Verify that `getEnvironment(configId)` returns a valid environment code and that Environment Selector (`Alt::Environment::Selector`) is included in the SDK subset. |
-| Stylus is not found | Check supported extension nodes, node status, and parent-child relation between Extension Module and Alt. |
-| Button does not work | Verify the selected HEI pin, wiring, `run()` call, and whether pressed should be `Low` or `High` for your hardware. |
-| Stylus appears offset | Recheck `ScreenPosition`, display pivot, unit scale, and whether `ScreenY` needs to be added for a bottom-center pivot. |
-| Stylus appears rotated incorrectly | Recheck engine handedness, quaternion order, environment rotation, and virtual display tilt. |
-| Stylus lags behind the real one | Tune `extrapolationTimeSeconds` and update pose closer to the final render submission. |
+`IInputPin::getState()` reads the latest pin state. Choose the polling cadence according to your engine input loop and the hardware update rate.
