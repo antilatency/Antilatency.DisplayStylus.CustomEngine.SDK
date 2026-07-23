@@ -1,10 +1,12 @@
 # Display Stylus SDK for Custom C++ Engines
 
 <p align="center">
-  <strong>How to integrate Antilatency Display Stylus tracking into a proprietary C++ engine.</strong>
+  <strong>How to integrate Antilatency Display Stylus tracking into a custom C++ engine.</strong>
 </p>
 
 <p align="center">
+  <a href="https://github.com/antilatency/Antilatency.DisplayStylus.Proxy">Display Stylus Proxy</a>
+  &middot;
   <a href="https://developers.antilatency.com/Sdk/Configurator_en.html">SDK Configurator</a>
   &middot;
   <a href="https://github.com/antilatency/Antilatency.DisplayStylus.Unity.SDK">Unity reference SDK</a>
@@ -23,19 +25,274 @@ The Display Stylus is built from standard Antilatency parts:
 - a **physical configurable environment/display controller** provides the screen geometry and the environment code;
 - the generated **Antilatency C++ SDK** already exposes the required low-level libraries.
 
-The Unity package is not a separate tracking system. It is a Unity-side wrapper around the same Antilatency SDK libraries. For a proprietary engine, the correct approach is to build a small engine-specific wrapper that connects these libraries to your own render loop, transform system, input system, and asset pipeline.
+There are two supported integration models:
 
-You can use the Unity package as a reference implementation, but your engine does not need to reproduce Unity concepts such as GameObjects, prefabs, or components:
+- **Proxy mode** keeps Device Network and all hardware tasks in the standalone
+  [Display Stylus Proxy](https://github.com/antilatency/Antilatency.DisplayStylus.Proxy)
+  process. Your engine receives display and stylus state over a local binary
+  WebSocket or HTTP endpoint.
+- **Direct ADN mode** loads the generated Antilatency C++ SDK in your process.
+  Your engine owns Device Network, discovers nodes, and starts the hardware tasks.
 
-https://github.com/antilatency/Antilatency.DisplayStylus.Unity.SDK
+Both models need a small engine-specific layer that connects display geometry,
+stylus transforms, and button state to your render and input systems. The
+[Unity package](https://github.com/antilatency/Antilatency.DisplayStylus.Unity.SDK)
+is a useful reference implementation for both modes, but a custom engine does
+not need Unity concepts such as GameObjects, prefabs, or components.
 
 ---
 
-## Why There Is No Universal Engine SDK
+## Choose an Integration Mode
 
-Every custom engine handles transforms, coordinate systems, rendering latency, input events, scene hierarchy, and display pivots differently. Because of that, Antilatency cannot provide one prebuilt wrapper that fits every proprietary engine.
+| | Proxy mode | Direct ADN mode |
+| --- | --- | --- |
+| ADN owner | Standalone proxy process | Your engine process |
+| Native Antilatency SDK in the engine | Not required | Required |
+| Tracking transport | Binary WebSocket or HTTP | Native SDK calls |
+| Multiple client processes | Supported | One ADN owner only |
+| Device writes | Exclusive, time-limited write lease | Direct SDK calls |
+| Best fit | Multiple clients, process isolation, or a portable client layer | Lowest-level control in one process |
 
-What Antilatency can provide is the important part: the C++ SDK libraries that let you:
+Use Proxy mode when more than one application needs the same Display Stylus
+state or when hardware ownership should be isolated from the engine. Use Direct
+ADN mode when the engine is the only Device Network owner and needs direct
+access to native SDK interfaces.
+
+Only one process can own the connected ADN. Do not run Direct ADN mode while
+the standalone proxy is active.
+
+---
+
+## Proxy Mode
+
+The proxy owns Device Network, starts the Physical Configurable Environment,
+Hardware Extension Interface, and Alt Tracking tasks, and publishes their
+results at a fixed loopback endpoint:
+
+```text
+http://127.0.0.1:48192
+```
+
+Download the executable from the
+[latest Display Stylus Proxy release](https://github.com/antilatency/Antilatency.DisplayStylus.Proxy/releases/latest),
+start it before the engine, and keep one proxy instance running for all local
+clients.
+
+```mermaid
+flowchart LR
+    Hardware["Display + Styluses"] --> Proxy["Display Stylus Proxy<br/>ADN and hardware tasks"]
+    Proxy -->|"Binary WebSocket frames"| Engine["Custom C++ Engine"]
+    Proxy -->|"Binary WebSocket frames"| Tools["Other local readers"]
+    Engine -.->|"JSON control command<br/>with write lease"| Proxy
+```
+
+### Reading display and stylus state
+
+Use `ws://127.0.0.1:48192/api/v2/stream` for continuous updates. Each WebSocket
+message contains one complete binary snapshot. Use
+`GET http://127.0.0.1:48192/api/v2/snapshot` for a one-time snapshot or
+diagnostics.
+
+Tracking data is not serialized as JSON. Protocol v2 uses bounded,
+little-endian binary messages with IEEE 754 `float32` math values:
+
+- `Vector3`: `x`, `y`, `z` (12 bytes);
+- `Quaternion`: `x`, `y`, `z`, `w` (16 bytes);
+- `Pose`: position followed by rotation (28 bytes).
+
+A decoded frame can be represented by engine-side types like these:
+
+```cpp
+struct DisplayStylusDisplayState {
+    bool connected;
+    std::optional<std::uint32_t> nodeId;
+    std::uint32_t configId;
+    std::uint32_t configCount;
+    Vec3 screenPosition;
+    Vec3 screenX;
+    Vec3 screenY;
+    Quat environmentRotation;
+};
+
+struct DisplayStylusState {
+    std::string id;
+    std::uint32_t extensionNodeId;
+    std::uint32_t trackingNodeId;
+    bool connected;
+    bool buttonPressed;
+    Pose poseEnvironment;
+    Vec3 velocityEnvironment;
+    Vec3 localAngularVelocity;
+    std::string trackingStage;
+    float stability;
+};
+
+struct DisplayStylusFrame {
+    std::int64_t sequence;
+    std::uint32_t networkUpdateId;
+    std::optional<DisplayStylusDisplayState> display;
+    std::vector<DisplayStylusState> styluses;
+};
+```
+
+Connect the engine's existing networking layer to the stream and publish only
+validated, fully decoded frames to gameplay code:
+
+```cpp
+void DisplayStylusProxySource::start() {
+    _socket.connect("ws://127.0.0.1:48192/api/v2/stream");
+}
+
+void DisplayStylusProxySource::onBinaryMessage(std::span<const std::byte> bytes) {
+    // Engine helper. Implement it exactly according to Binary Snapshot Protocol v2.
+    DisplayStylusFrame next = decodeDisplayStylusSnapshotV2(bytes);
+
+    _latestFrame = std::move(next);
+    _connected = true;
+}
+
+void DisplayStylusProxySource::onDisconnected() {
+    _connected = false;
+    _latestFrame.reset();       // Do not leave stale devices in the scene.
+    scheduleReconnect();        // Retry while the engine still needs the source.
+}
+```
+
+The decoder must validate the magic, protocol version, flags, counts, lengths,
+UTF-8 strings, total message size, and full payload consumption before exposing
+a frame. The first stream frame includes node topology. Later frames may omit
+it until `networkUpdateId` changes; cache the last topology if your tools use
+node properties, or skip it if the engine only needs display and stylus state.
+
+See
+[Binary Snapshot Protocol v2](https://github.com/antilatency/Antilatency.DisplayStylus.Proxy/blob/main/docs/BINARY_PROTOCOL.md)
+for the authoritative field order, limits, topology rules, and versioning
+policy. The proxy repository remains the canonical source for the wire
+protocol and endpoint behavior.
+
+`screenPosition`, `screenX`, `screenY`, `environmentRotation`, stylus poses,
+and motion vectors are published in Antilatency Environment space. Apply the
+same engine-coordinate mapping described in
+[Mapping to Engine Space](#mapping-to-engine-space).
+
+### Reconnection and readiness
+
+Treat transport connectivity and hardware readiness as separate states:
+
+- a connected stream with no display is a valid frame, not a transport error;
+- the display is ready when the frame contains a connected display;
+- a disconnected stylus must be removed or marked disconnected;
+- a stopped proxy, a restarted proxy, and a broken socket should all enter the
+  same reconnect loop;
+- after reconnecting, replace the cached state with the first new frame.
+
+Do not keep rendering the final pose from a disconnected stream unless your
+application deliberately implements a short, visible grace period.
+
+The proxy performs pose extrapolation before publishing a frame. Configure
+prediction in the proxy and do not apply the same extrapolation a second time
+in the client.
+
+### Keeping the engine API independent
+
+Keep transport and native SDK ownership behind one engine-facing data source.
+This lets a project choose Proxy or Direct ADN mode without changing gameplay,
+rendering, or input code:
+
+```cpp
+enum class DisplayStylusMode {
+    Proxy,
+    DirectAdn
+};
+
+class IDisplayStylusSource {
+public:
+    virtual ~IDisplayStylusSource() = default;
+    virtual void update() = 0;
+    virtual bool isConnected() const = 0;
+    virtual bool isReady() const = 0;
+    virtual const std::optional<DisplayStylusFrame>& latestFrame() const = 0;
+};
+
+std::unique_ptr<IDisplayStylusSource> createDisplayStylusSource(
+    DisplayStylusMode mode
+) {
+    if (mode == DisplayStylusMode::Proxy) {
+        return std::make_unique<DisplayStylusProxySource>();
+    }
+
+    return std::make_unique<DisplayStylusDirectAdnSource>();
+}
+```
+
+### Writing through the proxy
+
+Readers do not need a lease. A client must acquire the exclusive write lease
+before changing an ADN string property or selecting an existing display
+configuration. Other readers continue receiving snapshots while the lease is
+occupied, but no other client can write.
+
+Control requests are low-frequency JSON. The following transport-neutral
+pseudocode shows the complete acquire/write/release lifecycle:
+
+```cpp
+auto acquired = http.post(
+    "http://127.0.0.1:48192/api/v1/lease/acquire",
+    R"({"clientId":"custom-engine-editor","durationSeconds":15})",
+    "application/json"
+);
+
+if (acquired.status == 423) {
+    // Another client currently owns the write channel.
+    return;
+}
+
+requireSuccess(acquired);
+std::string leaseId = parseJson(acquired.body)["lease"]["leaseId"];
+
+// Engine helper. Its callback runs on every exit path from the current scope.
+ScopeExit releaseLease([&] {
+    http.post(
+        "http://127.0.0.1:48192/api/v1/lease/release",
+        json({{"leaseId", leaseId}}),
+        "application/json"
+    );
+});
+
+auto changed = http.put(
+    "http://127.0.0.1:48192/api/v1/nodes/12/properties/Tag",
+    json({{"leaseId", leaseId}, {"value", "Stylus"}}),
+    "application/json"
+);
+requireSuccess(changed);
+```
+
+Use URL encoding for the node-property key. A display configuration is selected
+with `PUT /api/v1/display/config` and a body containing `leaseId` and
+`configId`. This selects an existing configuration; it does not create or edit
+a calibration. Renew the lease before it expires when an editing operation
+takes longer than the requested duration.
+
+Expected failures return a JSON object with a stable `code` and a readable
+`message`. Lease acquisition returns `423 Locked` when another writer owns the
+channel. A missing, expired, or released lease returns `409 Conflict` with
+`write_lease_required`. Inspect the response body before reporting an error to
+the user.
+
+See the
+[proxy API documentation](https://github.com/antilatency/Antilatency.DisplayStylus.Proxy#api)
+for the current command list, lease lifetime, failure codes, and operational
+details instead of duplicating those values in an engine integration.
+
+---
+
+## Why There Is No Universal Engine Wrapper
+
+Every custom engine handles transforms, coordinate systems, rendering latency,
+input events, scene hierarchy, and display pivots differently. A small
+engine-owned wrapper is therefore still required in either integration mode.
+
+In Direct ADN mode, the generated C++ SDK libraries let you:
 
 - discover Antilatency devices;
 - read Physical Configurable Environment data;
@@ -47,7 +304,7 @@ Your engine wrapper should connect these pieces to your own concepts of a displa
 
 ---
 
-## Required SDK Components
+## Direct ADN Mode Requirements
 
 Generate an Antilatency SDK subset with the [SDK Configurator](https://developers.antilatency.com/Sdk/Configurator_en.html). At minimum, include these components:
 
@@ -68,7 +325,7 @@ You can add other components depending on your application, hardware, tools, and
 
 ---
 
-## Architecture
+## Direct ADN Architecture
 
 ```mermaid
 %%{init: {"flowchart": {"nodeSpacing": 45, "rankSpacing": 70}} }%%
@@ -123,7 +380,7 @@ The physical environment/display device provides screen geometry and an environm
 
 ---
 
-## Integration Flow
+## Direct ADN Integration Flow
 
 ### 1. Generate and Add the SDK
 
